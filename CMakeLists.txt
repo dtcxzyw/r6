@@ -16,8 +16,12 @@ message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 include(AddLLVM)
 
+find_package(Z3 REQUIRED)
+
 include_directories(${LLVM_INCLUDE_DIRS})
 set(LLVM_LINK_COMPONENTS core support irreader irprinter analysis instcombine passes)
 add_llvm_executable(constextract PARTIAL_SOURCES_INTENDED constextract.cpp)
 add_llvm_executable(constmat PARTIAL_SOURCES_INTENDED constmat.cpp)
 add_llvm_executable(costestimate PARTIAL_SOURCES_INTENDED costestimate.cpp)
+add_llvm_executable(encode PARTIAL_SOURCES_INTENDED encode.cpp)
+target_link_libraries(encode PRIVATE z3)

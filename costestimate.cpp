@@ -42,11 +42,13 @@
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/FormattedStream.h>
 #include <llvm/Support/InitLLVM.h>
+#include <llvm/Support/MathExtras.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/ToolOutputFile.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Transforms/Utils/Local.h>
+#include "immbits.hpp"
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -56,6 +58,7 @@
 #include <unordered_map>
 
 using namespace llvm;
+using namespace PatternMatch;
 namespace fs = std::filesystem;
 
 static cl::opt<std::string>
@@ -74,10 +77,52 @@ constexpr uint64_t GlobalCost = 2;
 constexpr uint64_t BitCountCost = 3;
 constexpr uint64_t UnsupportedCost = 1000;
 
+template <uint32_t K> auto m_Int() {
+  return m_CombineOr(m_Zero(), m_CheckedInt([&](const APInt &V) {
+                       if (V.getBitWidth() >= 64)
+                         return false;
+                       return isInt<K>(V.getSExtValue());
+                     }));
+}
+template <uint32_t K> auto m_UInt() {
+  return m_CombineOr(m_Zero(), m_CheckedInt([&](const APInt &V) {
+                       if (V.getBitWidth() >= 64)
+                         return false;
+                       return isUInt<K>(V.getZExtValue());
+                     }));
+}
+static auto m_ShAmt() { return m_UInt<ShAmtBits>(); }
+static auto m_BitImm() {
+  return m_CheckedInt([&](const APInt &V) {
+    if (V.getBitWidth() >= 64)
+      return false;
+    uint32_t Idx, Len;
+    if (isShiftedMask_64(V.getZExtValue(), Idx, Len) && Len <= 8)
+      return true;
+    if (V.getBitWidth() % 8 == 0 && V.isSplat(8))
+      return true;
+    if (V.countl_one() + V.countr_zero() == V.getBitWidth())
+      return true;
+    if (V.countl_zero() + V.countr_one() == V.getBitWidth())
+      return true;
+
+    return false;
+  });
+}
+static auto m_FPImm() {
+  return m_CheckedFp([&](const APFloat &V) {
+    auto Val = V;
+    bool loseInfo = false;
+    return Val.convert(APFloat::Float8E4M3FN(), APFloat::rmNearestTiesToEven,
+                       &loseInfo) == APFloat::opOK &&
+           !loseInfo;
+  });
+}
 class CostEstimator final : public InstVisitor<CostEstimator> {
 private:
   uint64_t Cost = 0;
   Module &Mod;
+  Function &Func;
   SimplifyQuery SQ;
   SmallPtrSet<Value *, 16> RequestedValues;
   void addOperands(Instruction &I, uint64_t K) {
@@ -88,49 +133,134 @@ private:
   void addCost(uint64_t K = 1) { Cost += K; }
 
 public:
-  explicit CostEstimator(Module &M) : Mod{M}, SQ(Mod.getDataLayout()) {}
+  explicit CostEstimator(Module &M, Function &F)
+      : Mod{M}, Func{F}, SQ(Mod.getDataLayout()) {}
 
   void visitUnaryOperator(UnaryInstruction &I) {
     assert(I.getOpcode() == Instruction::FNeg);
-    addOperands(I, 1);
+    auto *Op = I.getOperand(0);
+    // match fnabs
+    match(Op, m_FAbs(m_Value(Op)));
+    RequestedValues.insert(Op);
+    addCost(FCheapOpCost);
   }
   void countMul(Value *LHS, Value *RHS) {
+    assert(!match(RHS, m_One()));
+    assert(!match(RHS, m_Zero()));
+
     RequestedValues.insert(LHS);
-    RequestedValues.insert(RHS);
-    addCost(MulCost);
+    if (match(RHS, m_Power2()))
+      addCost();
+    else if (match(RHS, m_Int<MulDivBits>())) {
+      addCost();
+    } else {
+      RequestedValues.insert(RHS);
+      addCost(MulCost);
+    }
   }
   void countAdd(Value *LHS, Value *RHS) {
+    assert(!match(RHS, m_Zero()));
+
     RequestedValues.insert(LHS);
-    RequestedValues.insert(RHS);
+    if (!match(RHS, m_Int<AddSubImmBits>()))
+      RequestedValues.insert(RHS);
     addCost();
+  }
+  void countMulAdd(Value *LHS, Value *RHS, Value *Add) {
+    countMul(LHS, RHS);
+    countAdd(LHS, Add);
   }
   void visitBinaryOperator(BinaryOperator &I) {
     switch (I.getOpcode()) {
     case Instruction::Add:
       countAdd(I.getOperand(0), I.getOperand(1));
       break;
+    case Instruction::Sub:
+      if (!match(I.getOperand(0), m_Int<AddSubImmBits>()))
+        RequestedValues.insert(I.getOperand(0));
+      RequestedValues.insert(I.getOperand(1));
+      addCost();
+      break;
+    case Instruction::Shl:
+    case Instruction::AShr:
+    case Instruction::LShr:
+      if (!match(I.getOperand(0), m_Int<ShiftImmBits>()))
+        RequestedValues.insert(I.getOperand(0));
+      else if (!match(I.getOperand(1), m_ShAmt()))
+        RequestedValues.insert(I.getOperand(1));
+      addCost();
+      break;
     case Instruction::Mul:
       countMul(I.getOperand(0), I.getOperand(1));
       break;
+    case Instruction::And:
+    case Instruction::Or:
+    case Instruction::Xor: {
+      auto *LHS = I.getOperand(0);
+      auto *RHS = I.getOperand(1);
+
+      // absorb not
+      if (!match(LHS, m_Not(m_Value(LHS))))
+        match(RHS, m_Not(m_Value(RHS)));
+
+      RequestedValues.insert(LHS);
+      if (!match(RHS, m_BitImm()))
+        RequestedValues.insert(RHS);
+      addCost();
+    } break;
     case Instruction::UDiv:
-    case Instruction::SDiv:
-    case Instruction::URem:
-    case Instruction::SRem:
-      addOperands(I, DivCost);
+    case Instruction::URem: {
+      auto *LHS = I.getOperand(0);
+      auto *RHS = I.getOperand(1);
+      RequestedValues.insert(LHS);
+      if (!match(RHS, m_UInt<MulDivBits>()))
+        RequestedValues.insert(RHS);
+      addCost(DivCost);
       break;
+    }
+    case Instruction::SDiv:
+    case Instruction::SRem: {
+      auto *LHS = I.getOperand(0);
+      auto *RHS = I.getOperand(1);
+      RequestedValues.insert(LHS);
+      if (!match(RHS, m_UInt<MulDivBits>()))
+        RequestedValues.insert(RHS);
+      addCost(DivCost);
+      break;
+    }
     case Instruction::FRem:
       addOperands(I, GlobalCost + JumpCost);
       break;
-    case Instruction::FDiv:
-      addOperands(I, FDivCost);
+    case Instruction::FDiv: {
+      auto *LHS = I.getOperand(0);
+      auto *RHS = I.getOperand(1);
+      RequestedValues.insert(LHS);
+      if (!match(RHS, m_FPImm()))
+        RequestedValues.insert(RHS);
+      addCost(FDivCost);
       break;
-    case Instruction::FMul:
-      addOperands(I, FMulCost);
+    }
+    case Instruction::FMul: {
+      auto *LHS = I.getOperand(0);
+      auto *RHS = I.getOperand(1);
+      RequestedValues.insert(LHS);
+      if (!match(RHS, m_FPImm()))
+        RequestedValues.insert(RHS);
+      addCost(FMulCost);
       break;
+    }
     case Instruction::FAdd:
-    case Instruction::FSub:
-      addOperands(I, FCheapOpCost);
+    case Instruction::FSub: {
+      auto *LHS = I.getOperand(0);
+      auto *RHS = I.getOperand(1);
+      if (I.getOpcode() == Instruction::FSub)
+        std::swap(LHS, RHS);
+      RequestedValues.insert(LHS);
+      if (!match(RHS, m_FPImm()))
+        RequestedValues.insert(RHS);
+      addCost(FCheapOpCost);
       break;
+    }
     default:
       addOperands(I, 1);
     }
@@ -141,10 +271,25 @@ public:
                        ? FCheapOpCost
                        : 1);
   }
+  void visitSExtInst(SExtInst &I) { addOperands(I, 0); }
+  void visitZExtInst(ZExtInst &I) { addOperands(I, !I.hasNonNeg()); }
+  void visitTruncInst(TruncInst &I) { addOperands(I, !I.hasNoSignedWrap()); }
   void visitCmp(CmpInst::Predicate Pred, Value *LHS, Value *RHS) {
-    RequestedValues.insert(LHS);
-    RequestedValues.insert(RHS);
-    addCost(LHS->getType()->isFPOrFPVectorTy() ? FCheapOpCost : 1);
+    if (LHS->getType()->isFPOrFPVectorTy()) {
+      auto [V, Test] = fcmpToClassTest(Pred, Func, LHS, RHS);
+      if (!V) {
+        RequestedValues.insert(LHS);
+        if (!match(RHS, m_FPImm()))
+          RequestedValues.insert(RHS);
+      } else
+        RequestedValues.insert(V);
+      addCost(FCheapOpCost);
+    } else {
+      RequestedValues.insert(LHS);
+      if (!match(RHS, m_Int<CmpImmBits>()))
+        RequestedValues.insert(RHS);
+      addCost();
+    }
   }
   void visitCmpInst(CmpInst &I) {
     visitCmp(I.getPredicate(), I.getOperand(0), I.getOperand(1));
@@ -170,6 +315,21 @@ public:
       break;
     }
     case Intrinsic::abs: {
+      // absdiff
+      Value *LHS, *RHS;
+      if (match(I.getArgOperand(0), m_Sub(m_Value(LHS), m_Value(RHS)))) {
+        RequestedValues.insert(LHS);
+        RequestedValues.insert(RHS);
+        addCost();
+        break;
+      }
+
+      addCost();
+      RequestedValues.insert(I.getArgOperand(0));
+      break;
+    }
+    case Intrinsic::bswap:
+    case Intrinsic::bitreverse: {
       addCost();
       RequestedValues.insert(I.getArgOperand(0));
       break;
@@ -180,12 +340,24 @@ public:
     case Intrinsic::umin: {
       addCost();
       RequestedValues.insert(I.getArgOperand(0));
-      RequestedValues.insert(I.getArgOperand(1));
+      if (!match(I.getArgOperand(1), m_Int<MinMaxImmBits>()))
+        RequestedValues.insert(I.getArgOperand(1));
+      break;
+    }
+    case Intrinsic::copysign: {
+      addCost(FCheapOpCost);
+      auto *Mag = I.getArgOperand(0);
+      if (!match(Mag, m_FPImm()))
+        RequestedValues.insert(Mag);
+
+      auto *Sign = I.getArgOperand(1);
+      // match fncopysign
+      match(Sign, m_FNeg(m_Value(Sign)));
+      RequestedValues.insert(Sign);
       break;
     }
     case Intrinsic::fabs:
     case Intrinsic::is_fpclass:
-    case Intrinsic::copysign:
     case Intrinsic::minnum:
     case Intrinsic::maxnum:
     case Intrinsic::minimum:
@@ -199,15 +371,48 @@ public:
       RequestedValues.insert(I.getArgOperand(0));
       break;
     }
+    case Intrinsic::fma:
+    case Intrinsic::fmuladd: {
+      addCost(FMulCost);
+      RequestedValues.insert(I.getArgOperand(0));
+      RequestedValues.insert(I.getArgOperand(1));
+      RequestedValues.insert(I.getArgOperand(2));
+      break;
+    }
+    case Intrinsic::fshl:
+    case Intrinsic::fshr: {
+      addCost();
+      RequestedValues.insert(I.getArgOperand(0));
+      RequestedValues.insert(I.getArgOperand(1));
+      if (!match(I.getArgOperand(2), m_ShAmt()))
+        RequestedValues.insert(I.getArgOperand(2));
+      break;
+    }
     case Intrinsic::assume:
       break;
     }
   }
-  void visitSelectInst(SelectInst &I) { addOperands(I, 2 + JumpCost); }
+  void visitSelectInst(SelectInst &I) {
+    // TODO: handle logical and/or
+    // if (I.getType()->isIntegerTy(1) &&
+    //     match(&I, m_LogicalOp(m_Value(), m_Value()))) {
+    //   return;
+    // }
+
+    auto *LHS = I.getTrueValue();
+    auto *RHS = I.getFalseValue();
+
+    RequestedValues.insert(I.getCondition());
+    if (!match(LHS, m_Int<SelectImmBits>()))
+      RequestedValues.insert(LHS);
+    if (!match(RHS, m_Int<SelectImmBits>()))
+      RequestedValues.insert(RHS);
+    addCost();
+  }
   void visitFreezeInst(FreezeInst &I) {
     RequestedValues.insert(I.getOperand(0));
   }
-  void visitReturnInst(ReturnInst &I) { addCost(JumpCost); }
+  void visitReturnInst(ReturnInst &I) { addOperands(I, JumpCost); }
   void visitLoadInst(LoadInst &I) { addOperands(I, LoadStoreCost); }
   void visitStoreInst(StoreInst &I) { addOperands(I, LoadStoreCost); }
   void visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
@@ -216,14 +421,27 @@ public:
   void visitAtomicRMWInst(AtomicRMWInst &I) { addOperands(I, LoadStoreCost); }
   void visitFenceInst(FenceInst &I) {}
   void visitUnreachableInst(UnreachableInst &I) {}
-  void visitBranchInst(BranchInst &I) { addOperands(I, JumpCost); }
+  void visitBranchInst(BranchInst &I) {
+    if (I.isConditional()) {
+      if (auto *Cmp = dyn_cast<ICmpInst>(I.getCondition())) {
+        auto *LHS = Cmp->getOperand(0);
+        auto *RHS = Cmp->getOperand(1);
+        RequestedValues.insert(LHS);
+        if (!match(RHS, m_Int<BranchCmpImmBits>()))
+          RequestedValues.insert(RHS);
+        addCost();
+        return;
+      }
+    }
+    addOperands(I, JumpCost);
+  }
   void visitSwitchInst(SwitchInst &I) {
     // Expand to icmp + br
     addOperands(I, JumpCost * (I.getNumCases() - I.defaultDestUndefined()));
     for (auto &Case : I.cases())
       visitCmp(ICmpInst::ICMP_EQ, I.getCondition(), Case.getCaseValue());
   }
-  void visitPHINode(PHINode &PHI) { addCost(PHI.getNumIncomingValues()); }
+  void visitPHINode(PHINode &PHI) {}
   void visitIndirectBrInst(IndirectBrInst &I) { addOperands(I, JumpCost); }
   void visitExtractValueInst(ExtractValueInst &I) {
     addOperands(I, UnsupportedCost);
@@ -245,14 +463,17 @@ public:
     I.collectOffset(DL, 64, VariableOffsets, ConstantOffset);
 
     for (auto &[V, Scale] : VariableOffsets) {
-      if (Scale != 1) {
-        countMul(V, ConstantInt::get(I.getContext(), Scale));
-      } else
+      if (Scale != 1)
+        countMulAdd(V, ConstantInt::get(I.getContext(), Scale),
+                    I.getPointerOperand());
+      else {
         RequestedValues.insert(V);
-      addCost();
+        addCost();
+      }
     }
-    countAdd(I.getPointerOperand(),
-             ConstantInt::get(I.getContext(), ConstantOffset));
+    if (!ConstantOffset.isZero())
+      countAdd(I.getPointerOperand(),
+               ConstantInt::get(I.getContext(), ConstantOffset));
   }
   void visitShuffleVectorInst(ShuffleVectorInst &I) {
     addOperands(I, UnsupportedCost);
@@ -310,12 +531,36 @@ public:
     }
 
     for (auto V : RequestedValues) {
-      if (isa<ConstantExpr>(V))
-        addCost(GlobalCost);
-      if (isa<ConstantInt>(V)) {
+      if (auto *CI = dyn_cast<ConstantInt>(V); CI && CI->getBitWidth() <= 64) {
+        auto Val = CI->getSExtValue();
+
+        if (isInt<LargeImmBits>(Val)) {
+          addCost();
+          continue;
+        }
+
+        if (match(CI, m_BitImm())) {
+          addCost();
+          continue;
+        }
+
+        if (isInt<LargeImmBits + AddSubImmBits>(Val)) {
+          addCost(2);
+          continue;
+        }
+
         addCost(LoadStoreCost);
       }
-      if (isa<ConstantFP>(V)) {
+      if (auto *CFP = dyn_cast<ConstantFP>(V)) {
+        auto APF = CFP->getValueAPF();
+        bool loseInfo = false;
+        if (APF.convert(APFloat::IEEEhalf(), APFloat::rmNearestTiesToEven,
+                        &loseInfo) == APFloat::opOK &&
+            !loseInfo) {
+          addCost(FCheapOpCost);
+          continue;
+        }
+
         addCost(LoadStoreCost);
       }
     }
@@ -329,7 +574,7 @@ static uint64_t estimateCost(Module &M) {
   for (auto &F : M) {
     if (F.empty())
       continue;
-    CostEstimator Estimator{M};
+    CostEstimator Estimator{M, F};
     Cost += Estimator.run(F);
   }
   return Cost;
