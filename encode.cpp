@@ -12,7 +12,7 @@
 #include <z3++.h>
 
 constexpr uint32_t InstructionBits = 32;
-constexpr uint32_t RegBits = 6;
+constexpr uint32_t RegBits = 5;
 constexpr uint32_t BinOpReg = RegBits * 3;
 constexpr uint32_t UnOpReg = RegBits * 2;
 constexpr uint32_t OpTypeBits = 2; // 8 16 32 64
@@ -121,6 +121,12 @@ constexpr Op Ops[] = {
     {"BCMP", RegBits * 2 + OpTypeBits + 4 + BranchOffsetImmBits},       //
     {"BCMPI",
      RegBits + BranchCmpImmBits + OpTypeBits + 4 + BranchOffsetImmBits}, //
+    {"SHLIADD", BinOpReg + OpTypeBits + ShAmtBits},                      //
+    {"MULIADD", BinOpReg + OpTypeBits + SmallMulBits},                   //
+    {"SRLIDIFF", BinOpReg + OpTypeBits + ShAmtBits},                     //
+    {"SRAIDIFF", BinOpReg + OpTypeBits + ShAmtBits},                     //
+    {"UDIVIDIFF", BinOpReg + OpTypeBits + SmallMulBits},                 //
+    {"SDIVIDIFF", BinOpReg + OpTypeBits + SmallMulBits},                 //
 };
 
 constexpr bool isUnique() {

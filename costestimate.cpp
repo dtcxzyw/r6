@@ -26,6 +26,7 @@
 #include <llvm/IR/InstVisitor.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -55,7 +56,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
-#include <unordered_map>
+#include <set>
 
 using namespace llvm;
 using namespace PatternMatch;
@@ -65,7 +66,6 @@ static cl::opt<std::string>
     InputDir(cl::Positional, cl::desc("<directory for input LLVM IR files>"),
              cl::Required, cl::value_desc("inputdir"));
 
-constexpr uint64_t Cost = 0;
 constexpr uint64_t LoadStoreCost = 4;
 constexpr uint64_t JumpCost = 1;
 constexpr uint64_t MulCost = 3;
@@ -75,7 +75,7 @@ constexpr uint64_t FMulCost = 5;
 constexpr uint64_t FCheapOpCost = 3;
 constexpr uint64_t GlobalCost = 2;
 constexpr uint64_t BitCountCost = 3;
-constexpr uint64_t UnsupportedCost = 1000;
+constexpr uint64_t UnsupportedCost = 0;
 
 template <uint32_t K> auto m_Int() {
   return m_CombineOr(m_Zero(), m_CheckedInt([&](const APInt &V) {
@@ -118,6 +118,8 @@ static auto m_FPImm() {
            !loseInfo;
   });
 }
+std::set<std::string> UnsupportedIntrinsics;
+
 class CostEstimator final : public InstVisitor<CostEstimator> {
 private:
   uint64_t Cost = 0;
@@ -161,12 +163,52 @@ public:
   void countAdd(Value *LHS, Value *RHS) {
     assert(!match(RHS, m_Zero()));
 
+    Value *X;
+    if (match(LHS, m_Shl(m_Value(X), m_ShAmt()))) {
+      RequestedValues.insert(X);
+      RequestedValues.insert(RHS);
+      addCost();
+      return;
+    }
+    if (match(RHS, m_Shl(m_Value(X), m_ShAmt()))) {
+      RequestedValues.insert(X);
+      RequestedValues.insert(LHS);
+      addCost();
+      return;
+    }
+    if (match(LHS, m_c_Mul(m_Value(X), m_UInt<SmallMulBits>()))) {
+      RequestedValues.insert(X);
+      RequestedValues.insert(RHS);
+      addCost(MulCost);
+      return;
+    }
+    if (match(RHS, m_c_Mul(m_Value(X), m_UInt<SmallMulBits>()))) {
+      RequestedValues.insert(X);
+      RequestedValues.insert(LHS);
+      addCost(MulCost);
+      return;
+    }
+
     RequestedValues.insert(LHS);
     if (!match(RHS, m_Int<AddSubImmBits>()))
       RequestedValues.insert(RHS);
     addCost();
   }
   void countMulAdd(Value *LHS, Value *RHS, Value *Add) {
+    if (match(RHS, m_Power2())) {
+      RequestedValues.insert(LHS);
+      RequestedValues.insert(Add);
+      addCost();
+      return;
+    }
+
+    if (match(RHS, m_UInt<SmallMulBits>())) {
+      RequestedValues.insert(LHS);
+      RequestedValues.insert(Add);
+      addCost(MulCost);
+      return;
+    }
+
     countMul(LHS, RHS);
     countAdd(LHS, Add);
   }
@@ -181,9 +223,19 @@ public:
       RequestedValues.insert(I.getOperand(1));
       addCost();
       break;
-    case Instruction::Shl:
     case Instruction::AShr:
-    case Instruction::LShr:
+    case Instruction::LShr: {
+      Value *V1, *V2;
+      if (match(I.getOperand(0), m_Sub(m_Value(V1), m_Value(V2))) &&
+          match(I.getOperand(1), m_ShAmt())) {
+        RequestedValues.insert(V1);
+        RequestedValues.insert(V2);
+        addCost();
+        break;
+      }
+    }
+      [[fallthrough]];
+    case Instruction::Shl:
       if (!match(I.getOperand(0), m_Int<ShiftImmBits>()))
         RequestedValues.insert(I.getOperand(0));
       else if (!match(I.getOperand(1), m_ShAmt()))
@@ -212,9 +264,16 @@ public:
     case Instruction::URem: {
       auto *LHS = I.getOperand(0);
       auto *RHS = I.getOperand(1);
-      RequestedValues.insert(LHS);
-      if (!match(RHS, m_UInt<MulDivBits>()))
-        RequestedValues.insert(RHS);
+      Value *V1, *V2;
+      if (match(RHS, m_UInt<SmallMulBits>()) &&
+          match(LHS, m_Sub(m_Value(V1), m_Value(V2)))) {
+        RequestedValues.insert(V1);
+        RequestedValues.insert(V2);
+      } else {
+        RequestedValues.insert(LHS);
+        if (!match(RHS, m_UInt<MulDivBits>()))
+          RequestedValues.insert(RHS);
+      }
       addCost(DivCost);
       break;
     }
@@ -222,9 +281,16 @@ public:
     case Instruction::SRem: {
       auto *LHS = I.getOperand(0);
       auto *RHS = I.getOperand(1);
-      RequestedValues.insert(LHS);
-      if (!match(RHS, m_UInt<MulDivBits>()))
-        RequestedValues.insert(RHS);
+      Value *V1, *V2;
+      if (match(RHS, m_UInt<SmallMulBits>()) &&
+          match(LHS, m_Sub(m_Value(V1), m_Value(V2)))) {
+        RequestedValues.insert(V1);
+        RequestedValues.insert(V2);
+      } else {
+        RequestedValues.insert(LHS);
+        if (!match(RHS, m_Int<MulDivBits>()))
+          RequestedValues.insert(RHS);
+      }
       addCost(DivCost);
       break;
     }
@@ -303,8 +369,13 @@ public:
     Intrinsic::ID IID = I.getIntrinsicID();
     switch (IID) {
     default: {
-      addCost(UnsupportedCost);
-      visitCallBase(I);
+      if (!I.isDebugOrPseudoInst() && !I.isLifetimeStartOrEnd() &&
+          I.getIntrinsicID() <= Intrinsic::xray_typedevent) {
+        UnsupportedIntrinsics.insert(
+            std::string(I.getCalledFunction()->getName()));
+        addCost(UnsupportedCost);
+        visitCallBase(I);
+      }
       break;
     }
     case Intrinsic::ctlz:
@@ -388,16 +459,29 @@ public:
         RequestedValues.insert(I.getArgOperand(2));
       break;
     }
+    case Intrinsic::sadd_sat:
+    case Intrinsic::ssub_sat:
+    case Intrinsic::sshl_sat:
+    case Intrinsic::uadd_sat:
+    case Intrinsic::usub_sat:
+    case Intrinsic::ushl_sat:
+      addOperands(I, 2);
+      break;
+    case Intrinsic::trap:
+    case Intrinsic::debugtrap:
     case Intrinsic::assume:
       break;
     }
   }
   void visitSelectInst(SelectInst &I) {
-    // TODO: handle logical and/or
-    // if (I.getType()->isIntegerTy(1) &&
-    //     match(&I, m_LogicalOp(m_Value(), m_Value()))) {
-    //   return;
-    // }
+    Value *V1, *V2;
+    if (I.getType()->isIntegerTy(1) &&
+        match(&I, m_LogicalOp(m_Value(V1), m_Value(V2)))) {
+      RequestedValues.insert(V1);
+      RequestedValues.insert(V2);
+      addCost();
+      return;
+    }
 
     auto *LHS = I.getTrueValue();
     auto *RHS = I.getFalseValue();
@@ -426,10 +510,22 @@ public:
       if (auto *Cmp = dyn_cast<ICmpInst>(I.getCondition())) {
         auto *LHS = Cmp->getOperand(0);
         auto *RHS = Cmp->getOperand(1);
-        RequestedValues.insert(LHS);
+        Value *X, *Y;
+        if (match(I.getCondition(), m_LogicalOp(m_Value(X), m_Value(Y)))) {
+          RequestedValues.insert(X);
+          RequestedValues.insert(Y);
+        } else
+          RequestedValues.insert(LHS);
         if (!match(RHS, m_Int<BranchCmpImmBits>()))
           RequestedValues.insert(RHS);
-        addCost();
+        addCost(JumpCost);
+        return;
+      }
+      Value *X, *Y;
+      if (match(I.getCondition(), m_LogicalOp(m_Value(X), m_Value(Y)))) {
+        RequestedValues.insert(X);
+        RequestedValues.insert(Y);
+        addCost(JumpCost);
         return;
       }
     }
@@ -444,6 +540,28 @@ public:
   void visitPHINode(PHINode &PHI) {}
   void visitIndirectBrInst(IndirectBrInst &I) { addOperands(I, JumpCost); }
   void visitExtractValueInst(ExtractValueInst &I) {
+    const WithOverflowInst *WO;
+    if (match(&I, m_ExtractValue<0>(m_WithOverflowInst(WO)))) {
+      RequestedValues.insert(WO->getArgOperand(0));
+      RequestedValues.insert(WO->getArgOperand(1));
+      auto IID = WO->getIntrinsicID();
+      addCost(IID == Intrinsic::umul_with_overflow ||
+                      IID == Intrinsic::smul_with_overflow
+                  ? MulCost
+                  : 1);
+      return;
+    }
+    if (match(&I, m_ExtractValue<1>(m_WithOverflowInst(WO)))) {
+      RequestedValues.insert(WO->getArgOperand(0));
+      RequestedValues.insert(WO->getArgOperand(1));
+      auto IID = WO->getIntrinsicID();
+      addCost(IID == Intrinsic::umul_with_overflow ||
+                      IID == Intrinsic::smul_with_overflow
+                  ? MulCost
+                  : 1);
+      return;
+    }
+
     addOperands(I, UnsupportedCost);
   }
   void visitInsertValueInst(InsertValueInst &I) {
@@ -625,6 +743,9 @@ int main(int argc, char **argv) {
     Sum += V;
   }
   ResultFile << "Total " << Sum << '\n';
+
+  for (auto &Name : UnsupportedIntrinsics)
+    ResultFile << Name << '\n';
 
   return EXIT_SUCCESS;
 }
